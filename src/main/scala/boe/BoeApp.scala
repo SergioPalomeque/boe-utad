@@ -13,7 +13,7 @@ import org.apache.spark.rdd.JdbcRDD
 import org.jsoup.Jsoup
 
 import org.apache.spark.mllib.linalg.{Vectors, Vector}
-import org.apache.spark.mllib.linalg.distributed.{RowMatrix, MatrixEntry, CoordinateMatrix}
+import org.apache.spark.mllib.linalg.distributed.{RowMatrix, MatrixEntry}
 import org.apache.spark.mllib.clustering.{KMeans, KMeansModel}
 
 
@@ -25,6 +25,8 @@ object BoeApp extends App {
    * Filtrar palabras que no esten el la lista stopwords
    * Crear mega matriz. La fila es el documento. La columna las palabras del documento. El valor sera el numero de veces que esta ese documento
    */
+
+  var outputPath = "/Users/sergio/projects/proyecto-utad/output"
 
   val url = "192.168.1.42"
   val port = "5432"
@@ -54,7 +56,7 @@ object BoeApp extends App {
   }
 
   val query = "SELECT identificador, texto FROM boe_analisis_documento LIMIT ? OFFSET ?"
-  val data = new JdbcRDD(sc, createConnection, query, lowerBound = 1, upperBound = 1000, numPartitions = 2, mapRow = extractValues)
+  val data = new JdbcRDD(sc, createConnection, query, lowerBound = 1, upperBound = 50, numPartitions = 2, mapRow = extractValues)
   var wordsList = new HashMap[String, Int]()
 
   def splitLinesInWords (x: BoeDocument) = {
@@ -74,24 +76,18 @@ object BoeApp extends App {
   println("*********************************")
   val bWords = sc.broadcast(totalWords)
 
-  //var wordCount = filterWords.map(x => (x._2, 1)).reduceByKey{case (x, y) => x + y}
-
   val zero = (Array.empty[Int], Array.empty[Double])
 
   var wordCountByDocument = filterWords
     .map(x => ((x._1, x._2), 1))
     .reduceByKey((acc, value) => acc + value)
-    .map(x => (x._1._1, (x._1._2, x._2)))//.foreach(x => println(x))
+    .map(x => (x._1._1, (x._1._2, x._2)))
     .aggregateByKey(zero)((acc, curr) => {
         val index = bWords.value.indexOf(curr._1)
-        //println("index: " + index)
-        //println("curr: " + curr)
         var indexes = acc._1
         indexes :+= index
         var values = acc._2
         values :+= curr._2.toDouble
-        //println("result1: " + result1.deep.mkString(" "))
-        //println("result2: " + result2.deep.mkString(" "))
         (indexes, values)
       },
       (left, right) => {
@@ -104,22 +100,16 @@ object BoeApp extends App {
     })
     //.foreach(x => println(x))
 
-  //val mat = new RowMatrix(wordCountByDocument)
+  val mat = new RowMatrix(wordCountByDocument)
 
-  //println("num columns: " + mat.numCols)
+  println("numRows: " + mat.numRows())
 
-  //val numClusters = 5
-  //val numIterations = 20
-  //val clusters = KMeans.train(wordCountByDocument, numClusters, numIterations)
+  val simsPerfect = mat.columnSimilarities()
+  val simsEstimate = mat.columnSimilarities(0.8)
 
-  // Evaluate clustering by computing Within Set Sum of Squared Errors
-  //val WSSSE = clusters.computeCost(wordCountByDocument)
-  //println("Within Set Sum of Squared Errors = " + WSSSE)
+  simsEstimate.entries.saveAsTextFile(outputPath + "/simsEstimate.txt")
+  wordCountByDocument.saveAsTextFile(outputPath + "/wordCountByDocument.txt")
+  //println("Pairwise similarities are: " + simsPerfect.entries.collect.mkString(", "))
 
-
-  val kmeans = new KMeans()
-  val model = kmeans.run(wordCountByDocument)
-  model.clusterCenters.foreach(println)
-
-    //.foreach(x => println(x._1, x._2._1.deep.mkString(" "), x._2._2.deep.mkString(" ")))
+  //println("Estimated pairwise similarities are: " +     simsEstimate.entries.collect.mkString(", "))
 }
