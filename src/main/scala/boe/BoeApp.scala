@@ -4,17 +4,17 @@ import java.sql.{ResultSet, DriverManager}
 import java.text.Normalizer
 import java.util.regex.Pattern
 
-import scala.collection.mutable.HashMap
-
 import org.apache.spark.SparkContext
 import org.apache.spark.SparkContext._
 
 import org.apache.spark.rdd.JdbcRDD
 import org.jsoup.Jsoup
 
-import org.apache.spark.mllib.linalg.{Vectors, Vector}
-import org.apache.spark.mllib.linalg.distributed.{RowMatrix, MatrixEntry}
+import org.apache.spark.mllib.linalg.{Matrix, Matrices, Vectors, Vector}
+import org.apache.spark.mllib.linalg.distributed.{RowMatrix, CoordinateMatrix, MatrixEntry}
 import org.apache.spark.mllib.clustering.{KMeans, KMeansModel}
+
+import scala.collection.mutable.ListBuffer
 
 
 object BoeApp extends App {
@@ -26,9 +26,9 @@ object BoeApp extends App {
    * Crear mega matriz. La fila es el documento. La columna las palabras del documento. El valor sera el numero de veces que esta ese documento
    */
 
-  var outputPath = "/Users/sergio/projects/proyecto-utad/output"
+  val outputPath = "/Users/sergio/projects/proyecto-utad/output"
 
-  val url = "192.168.1.42"
+  val url = "192.168.1.41"
   val port = "5432"
   val database = "boe"
   val user = "sergio"
@@ -56,8 +56,7 @@ object BoeApp extends App {
   }
 
   val query = "SELECT identificador, texto FROM boe_analisis_documento LIMIT ? OFFSET ?"
-  val data = new JdbcRDD(sc, createConnection, query, lowerBound = 1, upperBound = 50, numPartitions = 2, mapRow = extractValues)
-  var wordsList = new HashMap[String, Int]()
+  val data = new JdbcRDD(sc, createConnection, query, lowerBound = 1, upperBound = 1050, numPartitions = 2, mapRow = extractValues)
 
   def splitLinesInWords (x: BoeDocument) = {
     x.getText.split(" ").map(y => (x.getId, y))
@@ -67,49 +66,111 @@ object BoeApp extends App {
     {x._2.length >= 3 && !stopWordsList.contains(x._2)}
   }
 
-  val documentWords = data.flatMap(splitLinesInWords)
-  val filterWords = documentWords.filter(cleanText)
+  val documentWords = data.filter(x => x.getText.length > 0)
+  val documentsTotalNumber = documentWords.count()
+  val filterWords = documentWords.flatMap(splitLinesInWords).filter(cleanText)
+  filterWords.cache()
 
   val totalWords = filterWords.map(x => x._2).distinct().collect()
   println("********** Total words ***********")
   println("* " + totalWords.length + " *")
   println("*********************************")
-  val bWords = sc.broadcast(totalWords)
+
+  println("********** Total documents ***********")
+  println("* " + documentsTotalNumber + " *")
+  println("*********************************")
+
+  val bWords = sc.broadcast(totalWords.zipWithIndex.toMap.map(_.swap))
 
   val zero = (Array.empty[Int], Array.empty[Double])
 
-  var wordCountByDocument = filterWords
-    .map(x => ((x._1, x._2), 1))
+  val docTermFreqs = filterWords
+    .map{
+      case(id, word) => ((id, word), 1)
+    }
     .reduceByKey((acc, value) => acc + value)
-    .map(x => (x._1._1, (x._1._2, x._2)))
+  docTermFreqs.cache()
+
+  val wordCountVectorByDocument = docTermFreqs
+    .map{
+      case ((id, word), count) => (id, (word, count))
+    }
     .aggregateByKey(zero)((acc, curr) => {
-        val index = bWords.value.indexOf(curr._1)
-        var indexes = acc._1
-        indexes :+= index
-        var values = acc._2
-        values :+= curr._2.toDouble
-        (indexes, values)
-      },
-      (left, right) => {
-        (left._1 ++ right._1, left._2 ++ right._2)
-      })
-    .map(x => {
-      val indexes = x._2._1
-      val values = x._2._2
-      Vectors.sparse(bWords.value.length, indexes, values)
+      val index = bWords.value.find(_._2 == curr._1).head._1
+      var indexes = acc._1
+      indexes :+= index
+      var values = acc._2
+      values :+= curr._2.toDouble
+      (indexes, values)
+    },
+    (left, right) => {
+      (left._1 ++ right._1, left._2 ++ right._2)
     })
-    //.foreach(x => println(x))
+    .map{
+    case (id, (indices, values)) => (id, Vectors.sparse(bWords.value.size, indices, values))
+    }
 
-  val mat = new RowMatrix(wordCountByDocument)
+  //wordCountVectorByDocument.foreach(x => println(x))
 
-  println("numRows: " + mat.numRows())
+  val tf = wordCountVectorByDocument
+  .map{
+    case (id, vector) => (id, vector, vector.toSparse.values.sum)
+  }
+  .map{
+    case (id, vector, wordsCounter) => {
+      val indices = vector.toSparse.indices
+      val values = vector.toSparse.values.transform(x => x/wordsCounter)
+      (id, Vectors.sparse(bWords.value.size, indices, values.toArray))
+    }
+  }
+  tf.cache()
+  tf.saveAsTextFile(outputPath + "/tf")
 
-  val simsPerfect = mat.columnSimilarities()
-  val simsEstimate = mat.columnSimilarities(0.8)
+  // numero documentos donde una palabra se encuentra
+  val idf = docTermFreqs
+  .map{
+    case ((id, word), count) => (word, 1)
+  }.reduceByKey((acc, value) => acc + value)
+  .map{
+    case (id, count) => (id, 1 + Math.log(documentsTotalNumber/count))
+  }
+  idf.saveAsTextFile(outputPath + "/idf")
 
-  simsEstimate.entries.saveAsTextFile(outputPath + "/simsEstimate.txt")
-  wordCountByDocument.saveAsTextFile(outputPath + "/wordCountByDocument.txt")
-  //println("Pairwise similarities are: " + simsPerfect.entries.collect.mkString(", "))
+  val bIdf = sc.broadcast(idf.collectAsMap())
 
-  //println("Estimated pairwise similarities are: " +     simsEstimate.entries.collect.mkString(", "))
+  val tfIdf = tf
+    .map{
+      case (id, tfVector) => {
+        val vector = tfVector.toSparse.values
+        val indices = tfVector.toSparse.indices
+        val values = new Array[Double](indices.length)
+        for(i <- 0 until indices.length) {
+          val word = bWords.value(indices.apply(i))
+          values(i) = vector.apply(i) * bIdf.value(word)
+        }
+        (id, Vectors.sparse(bWords.value.size, indices, values))
+      }
+    }
+
+  tfIdf.saveAsTextFile(outputPath + "/tfIdf")
+
+  val matrix = tfIdf.map(x => x._2)
+    .zipWithUniqueId()
+    .map {
+      case (vector, index) => {
+        val indices = vector.toSparse.indices
+        var l = List[MatrixEntry]()
+        for(j <- 0 until indices.length) {
+          l = MatrixEntry(index, vector.toSparse.indices.apply(j), vector.toSparse.values.apply(j)) :: l
+        }
+        l
+      }
+    }
+    .flatMap(x => x)
+
+  val mat = new CoordinateMatrix(matrix)
+  val result = mat.transpose().toRowMatrix().columnSimilarities()
+
+  result.entries.saveAsTextFile(outputPath + "/simsEstimate")
+
 }
