@@ -2,6 +2,7 @@ package boe
 
 import java.sql.{ResultSet, DriverManager}
 
+import com.mongodb.hadoop.{MongoOutputFormat, MongoInputFormat}
 import com.mongodb.hadoop.io.BSONWritable
 import org.apache.spark.SparkContext
 import org.apache.spark.SparkContext._
@@ -14,21 +15,26 @@ import org.apache.spark.mllib.linalg.{Vectors}
 import org.apache.spark.mllib.linalg.distributed.{CoordinateMatrix, MatrixEntry}
 
 import org.apache.hadoop.conf.Configuration
-import com.mongodb.hadoop.{MongoInputFormat, MongoOutputFormat, BSONFileInputFormat, BSONFileOutputFormat}
 
+import utils.DocumentTermMatrix
 import utils.DocumentTermMatrix._
 
 object BoeApp extends App {
 
-  val url = "192.168.1.130"
-  val port = 27017
-  val database = "boeStorage"
-  val collection = "boes"
+  if (args.length != 4) {
+    println("wrong params: url port databaseName collection" )
+    System.exit(0)
+  }
+
+  val url = args.apply(0)
+  val port = args.apply(1)
+  val database = args.apply(2)
+  val collection = args.apply(3)
 
   val mongoConfig = new Configuration()
   mongoConfig.set("mongo.input.uri", "mongodb://"+ url +":"+ port +"/"+ database +"."+ collection)
 
-  val sc = new SparkContext("local", "Simple", "$SPARK_HOME", List("target/utad-1.0-SNAPSHOT.jar"))
+  val sc = new SparkContext("local", "Simple", "$SPARK_HOME", List("target/utad-1.0.jar"))
 
   val documents = sc.newAPIHadoopRDD(
     mongoConfig,                // Configuration
@@ -43,8 +49,6 @@ object BoeApp extends App {
   val relationBetweenDocumentToRow = sc.broadcast(processedDocuments._2.map(_.swap).collectAsMap())
 
   val cosineSimilarity = mat.transpose().toRowMatrix().columnSimilarities()
-
-  //cosineSimilarity.entries.saveAsTextFile(outputPath + "/simsEstimate")
 
   val matrix = cosineSimilarity.entries.map {
     case (MatrixEntry(i, j, v)) => {
